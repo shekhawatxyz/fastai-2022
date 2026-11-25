@@ -1,4 +1,27 @@
 # Recursive acquisition of executable knowledge
+
+**Canonical branch: master. Read [architecture contract](ARCHITECTURE.md), [E16](experiment_16_event_composition.ipynb), and [E17 real trace](E17_REAL_TRACE.md).** CPU research only; no SOTA claim and no candidate GPU scaling yet.
+
+## Current research ledger
+
+| Experiment | Decision |
+|---|---|
+| [E1–E4](experiment_ledger_v4.ipynb) | Failed executor and shift tests; preserve original outputs |
+| [E5–E6](experiment_05_06.ipynb) | Shared revision / program reuse work in controlled tasks, negative transfer |
+| [E7](experiment_07_semantic.ipynb) | Overlapping behavioral classes, no uniform win |
+| [E8–E9](experiment_08_09_relations.ipynb) | Joint inference works when structured; semantic querying loses |
+| E10–E12 | Interrupted local work, not published or independently verified |
+| [E13](experiment_13_bidirectional.ipynb) | Bidirectional inference; frozen gate fails |
+| [E14](experiment_14_residual.ipynb) | Coarse baseline wins; frozen gate fails |
+| [E15](E15_REAL_TRACE.md) | Real cached WARC trace; zero gain |
+| [E16](experiment_16_event_composition.ipynb) | Toy gate passes; joint Bayesian inference over supplied language |
+| [E17](E17_REAL_TRACE.md) | Whole-event primitive ties teacher on reused development trace; role proposal coverage zero |
+
+Future test: event-relative participant relations, whole temporal events and learned schema discovery, with neural fallback and pretraining. Strongest conventional joint inference/library-learning comparators; independent real data before scale. See E17 for benchmark sources and data gate.
+
+<details><summary>Historical README through E6 (preserved)</summary>
+
+# Recursive acquisition of executable knowledge
 **Canonical branch: `master`. Start with [experiment_05_06.ipynb](experiment_05_06.ipynb), then [research_state.ipynb](research_state.ipynb) for the historical architecture and [experiment_04_stress.ipynb](experiment_04_stress.ipynb) for the previous negative result.** CPU only for current work. All notebooks and original saved Kaggle outputs are in this directory. Do not rerun archived GPU cells blindly.
 
 ![Architecture: failed executor, tested mechanisms, target](architecture.svg)
@@ -100,6 +123,9 @@ Optional ensembles average independently seeded predictions at additional cost; 
 The official MechEval scorer/annotations are not released. The published reference values in the script are **not comparable** to this all-changed-cell replay proxy. Evaluate frozen and TTT WARC on the same replay to make a valid comparison. No claim of novelty or benchmark superiority is made. To support the recursive mechanism, grow must beat stale, small and fixed, while controlling data, update count, exact-frame accuracy, false edits and wall time. If a direct copy baseline wins, reject the added machinery. If only the ensemble wins, attribute the gain to extra compute until proven otherwise. Synthetic experiments favor a supplied copy DSL; do not confuse them with independent evidence.
 
 Development note: the preceding fixed-slot prototype was CPU-smoke-tested; the expanded code and full upstream integration still require execution in Colab. The script starts with assertions to detect obvious causal leakage, invalid hard execution, failed parameter updates and label growth errors.
+
+
+</details>
 
 
 </details>
