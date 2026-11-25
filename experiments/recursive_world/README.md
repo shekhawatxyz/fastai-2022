@@ -4,6 +4,12 @@ Hypothesis: a discovered operation should be executable independently of its app
 
 The model is a recurrent convolutional executor, not a Transformer. Its initial copy/write vocabulary is supplied; the label dictionary, guards and conditional composition are learned. The active dictionary starts at four slots, splits high-error labels, and has a reserve of twelve. The same operations execute across three passes; label fields feed subsequent passes. Old training transitions get reassigned using the current dictionary. These are bounded, local experiments, not general program induction.
 
+## Start here — current experiment
+
+[Open the staged GPU notebook in Colab](https://colab.research.google.com/github/shekhawatxyz/fastai-2022/blob/research/recursive-world-model/experiments/recursive_world/colab.ipynb). The same notebook runs on Kaggle with Internet enabled.
+
+The notebook includes architecture diagrams, predictions before each run, a smoke test, a 24-exposure integration pilot, and a larger three-seed public-game sweep. New transfer arms reuse frozen held-out WARC predictions as features and learn a gated mixture with the new executor. Compare transfer_grow against transfer_direct, transfer_stale, transfer_small, transfer_fixed, and actual WARC TTT. The gate begins near the pretrained prediction. Frozen prior computation is cached and its cost logged separately. The released replay rotation multiplicities are matched. This is a public-replay proxy, not official MechEval. GPU execution and benchmark superiority remain unverified.
+
 ## Run
 
 Open `colab.ipynb` in Google Colab and select a GPU (A100/L4 preferable; T4 supported in FP32). Or use:
