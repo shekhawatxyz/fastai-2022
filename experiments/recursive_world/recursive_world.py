@@ -6,7 +6,7 @@ The MechEval paper numbers are references, NOT scores on our replay proxy.
 No game source, mechanic labels, or future observations enter prediction.
 """
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 import gc
 import json
@@ -322,7 +322,8 @@ def metrics(s,y,p):
     return dict(changed_acc=float(ok[ch].mean()) if ch.any() else np.nan,
                 false_edit=float(edit[~ch].mean()) if (~ch).any() else np.nan,
                 exact=float(ok.all()),cell_acc=float(ok.mean()),
-                change_f1=2*int((edit&ch).sum())/max(1,int(edit.sum()+ch.sum())))
+                change_f1=2*int((edit&ch).sum())/max(1,int(edit.sum()+ch.sum())),
+                changed_cells=int(ch.sum()),correct_changed=int((ok&ch).sum()))
 
 
 def synthetic(seed,n,ood=False,task="move"):
@@ -377,7 +378,7 @@ def parse(records,limit):
 
 
 def arc_streams(args):
-    counts={g:0 for g in args.games.split(",")}
+    counts={g:0 for g in (sorted(g for gs in FOLDS.values() for g in gs) if args.games=="all" else args.games.split(","))}
     if args.data:
         def records():
             for path in sorted(Path(args.data).rglob("*.recording.jsonl")):
@@ -433,7 +434,7 @@ def attach_priors(teacher,views,device):
         logits=teacher.forward_dynamics(h[:,-1],torch.zeros(len(h),device=device,dtype=torch.long),
                   *a[:,-1].unbind(-1),hist_obs=h,hist_action_ids=a[:,:2,0],
                   hist_action_xs=a[:,:2,1],hist_action_ys=a[:,:2,2])
-    for v,p in zip(views,logits.float().softmax(1).cpu().numpy()): v.prior=p
+    for v,p in zip(views,logits.float().softmax(1).cpu().numpy()): v.prior=p.astype(np.float16)
     return views
 
 
@@ -469,9 +470,10 @@ def warc_scores(game,stream,arm,seed,device):
         started=time.perf_counter(); _,p=predictor.predict(window,[a])
         torch.cuda.synchronize(); pt=time.perf_counter()-started
         row=metrics(s.s,s.y,np.asarray(p[0]))
-        started=time.perf_counter(); predictor.observe(window,a,s.y); window.push(a,s.y)
+        started=time.perf_counter(); info=predictor.observe(window,a,s.y); window.push(a,s.y)
         torch.cuda.synchronize()
-        yield dict(step=i,arm="WARC "+arm,seed=seed,predict_s=pt,update_s=time.perf_counter()-started,**row)
+        yield dict(step=i,arm="WARC "+arm,seed=seed,predict_s=pt,update_s=time.perf_counter()-started,
+                   updates=predictor.gradients,ttt_disabled=predictor.ttt_disabled,**row)
     del predictor; gc.collect(); torch.cuda.empty_cache()
 
 
@@ -573,6 +575,18 @@ def run(args):
                     kw["enabled"]=False
                     return torch.autocast(*a,**kw)
             ft.torch=FP32Torch()
+            # Muon also explicitly casts to BF16, outside autocast. T4 fallback.
+            from warc_model import varc2_optim as mu
+            @torch.no_grad()
+            def ns_fp32(g,steps=5):
+                x=g.float(); transposed=x.size(0)>x.size(1)
+                if transposed: x=x.T
+                x=x/(x.norm()+1e-7)
+                for _ in range(steps):
+                    a=x@x.T
+                    x=mu._NS_A*x+(mu._NS_B*a+mu._NS_C*(a@a))@x
+                return x.T if transposed else x
+            mu.zeropower_via_newtonschulz5=ns_fp32
             print("WARC BF16 unsupported; both models use FP32. Not identical to published precision.")
         for game,sid,stream in arc_streams(args):
             if profile_samples is None: profile_samples=stream[:8]
@@ -594,7 +608,7 @@ def run(args):
             if args.transfer:
                 teacher=frozen_teacher(game,args.device)
                 sync(); started=time.perf_counter()
-                cache=[attach_priors(teacher,rotation_views(s),args.device) for s in stream]
+                cache=[attach_priors(teacher,[replace(v) for v in rotation_views(s)],args.device) for s in stream]
                 sync(); teacher_seconds=time.perf_counter()-started
                 del teacher; gc.collect(); torch.cuda.empty_cache()
             modes=[(arm,False) for arm in arms]
