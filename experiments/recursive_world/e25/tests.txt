@@ -1,0 +1,13 @@
+test_boundary_finite (test_e25.Tests.test_boundary_finite) ... ok
+test_calibration (test_e25.Tests.test_calibration) ... ok
+test_gain_reversal (test_e25.Tests.test_gain_reversal) ... ok
+test_joint_identification (test_e25.Tests.test_joint_identification) ... ok
+test_last_and_scalar (test_e25.Tests.test_last_and_scalar) ... ok
+test_planner_interface (test_e25.Tests.test_planner_interface) ... ok
+test_zero_evidence (test_e25.Tests.test_zero_evidence) ... ok
+test_zero_residual (test_e25.Tests.test_zero_residual) ... ok
+
+----------------------------------------------------------------------
+Ran 8 tests in 0.012s
+
+OK
