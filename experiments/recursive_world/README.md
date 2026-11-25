@@ -1,3 +1,35 @@
+# Recursive acquisition of executable knowledge
+**Start with [research_state.ipynb](research_state.ipynb), then [experiment_04_stress.ipynb](experiment_04_stress.ipynb).** CPU only for current work. All notebooks and original saved Kaggle outputs are in this directory. Do not rerun archived GPU cells blindly.
+
+![Architecture: failed executor, tested mechanisms, target](architecture.svg)
+
+## Notebook index
+| Notebook | Purpose |
+|---|---|
+| [research_state.ipynb](research_state.ipynb) | Canonical architecture, references, decisions, unresolved questions |
+| [experiment_ledger_v4.ipynb](experiment_ledger_v4.ipynb) | Cumulative ledger through E4, original saved GPU outputs, CPU code and optional neural replay |
+| [experiment_04_stress.ipynb](experiment_04_stress.ipynb) | NEW: executed stress audit with irregular shifts and partial feedback |
+| [experiment_04.ipynb](experiment_04.ipynb) | E4 standalone CPU reproduction |
+| [experiment_ledger_v3.ipynb](experiment_ledger_v3.ipynb) | E3 rewrite and composition prior experiments |
+| [experiment_ledger_v2.ipynb](experiment_ledger_v2.ipynb) | E2 abstaining rule corrections, original output archive |
+| [experiment_01_kaggle.ipynb](experiment_01_kaggle.ipynb) | Original executed Kaggle notebook, unmodified archive |
+| [colab.ipynb](colab.ipynb) | Original GPU runner (historical, known bugs in pinned source) |
+| [recursive_world.py](recursive_world.py) | Original E1 implementation (historical; not recommended) |
+
+## Latest decision
+E3 joint prior beats factorized prior on controlled correlated tasks, fails under shift. E4 hard context reuse improves return to old regimes but not overall accuracy. Stress audit: context minus change-point = −0.36, −0.18, +0.03 pp for 1,4,81 feedback examples on irregular shifts; all intervals include zero. Random four-feedback gap −1.70 pp. Stop tuning hard allocation. **No current SOTA claim.**
+
+## Next serious experiment
+1. Build typed AST enumeration and discover reusable parameterized subprograms rather than rank a fixed bank. Compare flat enumeration, frequency/search priors, retrieval, and DreamCoder/Stitch-style library compression. Use equal candidate execution and wall-time budgets; account for library construction and meta-training cost. Hold out compositions and longer programs, use two independent task generators and noisy/out-of-library controls.
+2. Introduce explicit versioned dependencies and learned revision operators. Test delayed contradictions and counterexample-driven generalization separately from context selection. Freeze seeds and criteria before evaluation; report search attempts, accuracy by exposure, and paired stream intervals.
+3. Reuse pretrained WARC and the actual full TTT baseline on held-out recordings. Keep strong neural fallback, use only observed transitions for adaptation; compare simple retrieval/keep/consensus controls, report errors corrected and introduced, full compute and exact accuracy. No GPU until CPU gates pass.
+4. For a public SOTA claim, use an official available benchmark with matched protocol, exact evaluator and splits, full comparator reruns, uncertainty and compute. WARC's MechEval 69.1% is per-mechanic, not our replay metric. If official labels/scorer are unavailable, use a reproducible official ARC benchmark or make only a narrower claim against WARC on the declared replay proxy. Closed-loop ARC-AGI-3 requires the same agent/explorer and official action-efficiency evaluator. A world-model result is not an agent leaderboard result. Verify the current best published methods before any claim.
+
+### Relevant sources
+[WARC paper](https://arxiv.org/abs/2611.12324) · [WARC code](https://github.com/third-intelligence/WARC) · [DreamCoder](https://arxiv.org/abs/2006.08381) · [Stitch / Top-Down Synthesis for Library Learning](https://arxiv.org/abs/2211.16605) · [Stitch code](https://github.com/mlb2251/stitch) · [CodeARC](https://arxiv.org/abs/2503.23145) (candidate separate program-synthesis benchmark; protocol must be checked) · [BOCPD](https://arxiv.org/abs/0710.3742).
+ 
+<details><summary>Original E1 README (historical; superseded)</summary>
+
 # Recursive guarded world model
 
 Hypothesis: a discovered operation should be executable independently of its applicability, and later discoveries should change the interpretation of earlier observations.
@@ -64,3 +96,6 @@ Optional ensembles average independently seeded predictions at additional cost; 
 The official MechEval scorer/annotations are not released. The published reference values in the script are **not comparable** to this all-changed-cell replay proxy. Evaluate frozen and TTT WARC on the same replay to make a valid comparison. No claim of novelty or benchmark superiority is made. To support the recursive mechanism, grow must beat stale, small and fixed, while controlling data, update count, exact-frame accuracy, false edits and wall time. If a direct copy baseline wins, reject the added machinery. If only the ensemble wins, attribute the gain to extra compute until proven otherwise. Synthetic experiments favor a supplied copy DSL; do not confuse them with independent evidence.
 
 Development note: the preceding fixed-slot prototype was CPU-smoke-tested; the expanded code and full upstream integration still require execution in Colab. The script starts with assertions to detect obvious causal leakage, invalid hard execution, failed parameter updates and label growth errors.
+
+
+</details>
