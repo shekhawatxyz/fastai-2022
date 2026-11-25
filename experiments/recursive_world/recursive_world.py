@@ -11,6 +11,7 @@ from functools import lru_cache
 import gc
 import json
 import math
+import os
 from pathlib import Path
 import sys
 import time
@@ -400,7 +401,24 @@ def warc_scores(game,stream,arm,seed,device):
     from hist_window.src.history import HistoryWindow
     fold=next(f for f,gs in FOLDS.items() if game in gs)
     ckpt=hf_hub_download("third-intelligence/WARC",f"fold{fold}/checkpoint_best.pt")
-    predictor=FinalPredictor(ckpt,game=game,arm=arm,device=device,seed=seed,strict_split=True)
+    torch.manual_seed(seed)
+    if arm=="scratch":
+        # Same released architecture and online recipe, without pretrained parameters.
+        # Temporarily substitute its constructor; let FinalPredictor initialize its own optimizers.
+        from warc_model import final_ttt as ft
+        from warc_model.model import build_model,UNIFIED_DEFAULTS
+        original=ft.build_from_checkpoint
+        def scratch(path,*,device):
+            ck=torch.load(path,map_location="cpu",weights_only=False)
+            mc=ck["config"]["model_config"]
+            model,_=build_model(hist_n=mc["hist_n"],patch_size=mc["patch_size"],device=device,
+                                **{k:mc[k] for k in UNIFIED_DEFAULTS if k in mc})
+            return model,{k:v for k,v in ck.items() if k!="model_state"}
+        ft.build_from_checkpoint=scratch
+        try: predictor=FinalPredictor(ckpt,game=game,arm="ttt",device=device,seed=seed,strict_split=True)
+        finally: ft.build_from_checkpoint=original
+    else:
+        predictor=FinalPredictor(ckpt,game=game,arm=arm,device=device,seed=seed,strict_split=True)
     window=HistoryWindow(n=3)
     for i,s in enumerate(stream):
         if s.reset or not len(window): window.reset(s.s)
@@ -492,29 +510,74 @@ def run(args):
         if not (root/"agent"/"warc_model").exists(): raise FileNotFoundError(root)
         sys.path[:0]=[str(root/"agent"),str(root/"agent"/"VARC")]
         if args.device!="cuda": raise ValueError("ARC WARC comparison requires CUDA")
+        if not torch.cuda.is_bf16_supported():
+            # T4 has no native BF16. Keep upstream code unchanged on disk; change
+            # only the context manager used by the released predictor at runtime.
+            os.environ["WARC_PREDICT_BF16"]="0"
+            from warc_model import final_ttt as ft
+            class FP32Torch:
+                def __getattr__(self,name): return getattr(torch,name)
+                def autocast(self,*a,**kw):
+                    kw["enabled"]=False
+                    return torch.autocast(*a,**kw)
+            ft.torch=FP32Torch()
+            print("WARC BF16 unsupported; both models use FP32. Not identical to published precision.")
         for game,sid,stream in arc_streams(args):
             key=dict(game=game,session=sid)
+            # Simple no-training controls on the same stream; never use future examples.
+            history=[]
+            for i,s in enumerate(stream):
+                scores.append(dict(**key,arm="keep",seed=0,step=i,**metrics(s.s,s.y,s.s)))
+                candidates=[x for x in history if np.array_equal(x.a[-1],s.a[-1])]
+                if candidates:
+                    near=min(candidates,key=lambda x:np.count_nonzero(x.s!=s.s))
+                    p=np.where(near.s!=near.y,near.y,s.s)
+                else: p=s.s
+                scores.append(dict(**key,arm="local retrieval",seed=0,step=i,**metrics(s.s,s.y,p)))
+                history.append(s)
             for arm in arms:
+                members=[]
                 for seed in range(args.seeds):
                     l=Learner(arm,args.device,seed)
+                    probabilities=[]
                     for i,s in enumerate(stream):
-                        sync(); t=time.perf_counter(); p=l.predict(s).argmax(0); sync(); pt=time.perf_counter()-t
+                        sync(); t=time.perf_counter(); probs=l.predict(s); p=probs.argmax(0); sync(); pt=time.perf_counter()-t
+                        if args.ensemble: probabilities.append(probs)
                         row=metrics(s.s,s.y,p)
                         t=time.perf_counter(); l.observe(rotation_views(s)); l.online(i+1,args.steps); sync()
                         scores.append(dict(**key,arm=arm,seed=seed,step=i,predict_s=pt,update_s=time.perf_counter()-t,**row))
                         if (i+1)%8==0 or i==len(stream)-1: trace(l,i+1,dict(**key,arm=arm,seed=seed))
                     births.extend(dict(**key,arm=arm,seed=seed,**r) for r in l.events); save()
+                    if args.ensemble: members.append(np.stack(probabilities))
                     del l; gc.collect(); torch.cuda.empty_cache()
+                if args.ensemble and len(members)>1:
+                    for i,(sample,prob) in enumerate(zip(stream,np.mean(members,axis=0))):
+                        scores.append(dict(**key,arm=arm+"_ensemble",seed=-1,step=i,
+                                           **metrics(sample.s,sample.y,prob.argmax(0))))
+                save()
             if not args.skip_warc:
-                for arm in ("frozen","ttt"):
-                    for seed in range(args.seeds if arm=="ttt" else 1):
+                for arm in args.warc_arms.split(","):
+                    if arm not in ("frozen","ttt","scratch"): raise ValueError(arm)
+                    for seed in range(args.seeds if arm!="frozen" else 1):
                         for row in warc_scores(game,stream,arm,seed,args.device):
                             scores.append(dict(**key,**row))
                         save()
     save()
     df=pd.DataFrame(scores)
     group=["task","arm"] if "task" in df else ["game","arm"]
-    print(df.groupby(group)[["changed_acc","false_edit","exact","change_f1"]].mean().round(4))
+    metrics_cols=["changed_acc","false_edit","exact","change_f1"]
+    if "session" in df:
+        # Equal weighting per recording, then per game. Avoid long-recording bias.
+        per=df.groupby(["game","session","arm","seed"])[metrics_cols].mean()
+        paired=per.groupby(["game","session","arm"]).mean()
+        print(paired.groupby(["game","arm"]).mean().round(4))
+        pivot=paired["changed_acc"].unstack("arm")
+        if "grow" in pivot:
+            delta=pivot.apply(lambda col:pivot["grow"]-col)
+            delta.to_csv(out/"paired_changed_accuracy.csv")
+            print("Mean paired differences (grow - comparator):",delta.mean().round(4).to_dict())
+    else:
+        print(df.groupby(group)[metrics_cols].mean().round(4))
     print("\nPublished MechEval (NOT the replay proxy above):")
     print(pd.DataFrame(REFERENCE,index=["All_pct","EtC","not_reached_pct"]).T)
     if args.profile: profile_update(args.device,out)
@@ -534,6 +597,7 @@ if __name__=="__main__":
     p.add_argument("--limit",type=int,default=48)
     p.add_argument("--data"); p.add_argument("--warc-root",default="/content/WARC")
     p.add_argument("--skip-warc",action="store_true")
+    p.add_argument("--warc-arms",default="frozen,ttt,scratch")
     p.add_argument("--ensemble",action="store_true")
     p.add_argument("--profile",action="store_true")
     args=p.parse_args()
