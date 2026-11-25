@@ -34,7 +34,7 @@ REFERENCE = {
 FOLDS = {1:"bp35 lf52 lp85 r11l re86 sb26 sc25 su15 wa30".split(),
          2:"cd82 cn04 dc22 m0r0 sk48 tn36 tr87 tu93".split(),
          3:"ar25 ft09 g50t ka59 ls20 s5i5 sp80 vc33".split()}
-ARMS = ("direct", "copy", "static", "recursive", "fixed", "stale", "grow")
+ARMS = ("direct", "copy", "static", "recursive", "fixed", "small", "stale", "grow")
 
 
 @dataclass
@@ -101,7 +101,7 @@ class World(nn.Module):
             nn.GroupNorm(4,width),nn.SiLU())
         self.guard=nn.Conv2d(width,n,1)
         self.feedback=nn.Conv2d(n,K,1)
-        self.register_buffer("active",torch.arange(K)<(4 if self.dynamic else K))
+        self.register_buffer("active",torch.arange(K)<(4 if self.dynamic or arm=="small" else K))
         self.effects=nn.Parameter(torch.randn(K,O)*.1) if self.symbolic else None
         if self.symbolic:
             with torch.no_grad():
@@ -195,7 +195,7 @@ class Learner:
         self.data=[]; self.groups=[]; self.labels={}; self.updates=0
         self.amp=self.device.type=="cuda" and torch.cuda.is_bf16_supported()
         self.initial=self.snapshot(); self.previous=self.initial
-        self.events=[]; self.revision_distance=0.; self.loss=0.; self.grad=0.
+        self.events=[]; self.revision_distance=0.; self.revision_batches=0; self.loss=0.; self.grad=0.
 
     def snapshot(self):
         return {n:p.detach().float().cpu().clone() for n,p in self.model.named_parameters()}
@@ -237,7 +237,7 @@ class Learner:
         with torch.autocast(self.device.type,dtype=torch.bfloat16,enabled=self.amp):
             detail=self.model(h,a,details=True); pred,q,_,_=detail
             loss=balanced(-pred.gather(1,y[:,None]).squeeze(1).clamp_min(1e-7).log(),changed)
-            if self.arm in ("fixed","grow","stale"):
+            if self.arm in ("fixed","small","grow","stale"):
                 fresh=relabel(detail,y)
                 if self.arm=="stale":
                     target=torch.stack([self.labels[int(i)] for i in ids]).float()
@@ -247,7 +247,8 @@ class Learner:
                     old=[(j,self.labels[int(i)]) for j,i in enumerate(ids) if int(i) in self.labels]
                     if old:
                         js,qs=zip(*old)
-                        self.revision_distance=float((fresh[list(js)]-torch.stack(qs).float()).abs().sum(1).mean().detach())
+                        self.revision_distance+=float((fresh[list(js)]-torch.stack(qs).float()).abs().sum(1).mean().detach())
+                        self.revision_batches+=1
                     for i,v in zip(ids,fresh): self.labels[int(i)]=v.half()
                 loss=loss+.2*balanced(-(target*q.clamp_min(1e-7).log()).sum(1),changed)
         if not torch.isfinite(loss): raise FloatingPointError("Nonfinite loss")
@@ -433,16 +434,17 @@ def warc_scores(game,stream,arm,seed,device):
     del predictor; gc.collect(); torch.cuda.empty_cache()
 
 
-def profile_update(device,out):
+def profile_update(device,out,samples=None):
     """One separate warmed-up training step: profiler overhead cannot affect scores."""
     from torch.profiler import profile,ProfilerActivity,record_function
     l=Learner("grow",device,42)
-    for s in synthetic(42,8): l.observe([s])
-    l.step(range(8))
+    for s in (samples or synthetic(42,8))[:8]: l.observe([s])
+    ids=list(range(len(l.data)))
+    l.step(ids)
     activities=[ProfilerActivity.CPU]+([ProfilerActivity.CUDA] if device=="cuda" else [])
     with profile(activities=activities,record_shapes=True,profile_memory=True) as p:
         with record_function("recursive_update"):
-            l.step(range(8))
+            l.step(ids)
             if device=="cuda": torch.cuda.synchronize()
     p.export_chrome_trace(str(out/"trace.json"))
     table=p.key_averages().table(sort_by="self_cuda_time_total" if device=="cuda" else "self_cpu_time_total",row_limit=15)
@@ -469,14 +471,15 @@ def selftest(device):
 def run(args):
     import pandas as pd
     out=Path(args.out); out.mkdir(parents=True,exist_ok=True)
-    scores=[]; drift=[]; logs=[]; vocab=[]; births=[]
+    scores=[]; drift=[]; logs=[]; vocab=[]; births=[]; profile_samples=None
     arms=args.arms.split(","); assert all(a in ARMS for a in arms)
     def trace(l,epoch,key):
         logs.append(dict(**key,epoch=epoch,loss=l.loss,grad_norm=l.grad,updates=l.updates,
-                         revision_distance=l.revision_distance,active=int(l.model.active.sum()),
+                         revision_distance=l.revision_distance/max(1,l.revision_batches),active=int(l.model.active.sum()),
                          params=sum(p.numel() for p in l.model.parameters())))
         drift.extend(dict(**key,**r) for r in l.drift(epoch))
         vocab.extend(dict(**key,**r) for r in l.vocabulary(epoch))
+        l.revision_distance=0.; l.revision_batches=0
     def save():
         for name,rows in (("scores",scores),("epochs",logs),("weight_drift",drift),("vocabulary",vocab),("births",births)):
             pd.DataFrame(rows).to_csv(out/(name+".csv"),index=False)
@@ -523,6 +526,7 @@ def run(args):
             ft.torch=FP32Torch()
             print("WARC BF16 unsupported; both models use FP32. Not identical to published precision.")
         for game,sid,stream in arc_streams(args):
+            if profile_samples is None: profile_samples=stream[:8]
             key=dict(game=game,session=sid)
             # Simple no-training controls on the same stream; never use future examples.
             history=[]
@@ -544,6 +548,9 @@ def run(args):
                         sync(); t=time.perf_counter(); probs=l.predict(s); p=probs.argmax(0); sync(); pt=time.perf_counter()-t
                         if args.ensemble: probabilities.append(probs)
                         row=metrics(s.s,s.y,p)
+                        if l.model.symbolic and args.hard_arc:
+                            hard=l.predict(s,True).argmax(0)
+                            scores.append(dict(**key,arm=arm+"_hard",seed=seed,step=i,**metrics(s.s,s.y,hard)))
                         t=time.perf_counter(); l.observe(rotation_views(s)); l.online(i+1,args.steps); sync()
                         scores.append(dict(**key,arm=arm,seed=seed,step=i,predict_s=pt,update_s=time.perf_counter()-t,**row))
                         if (i+1)%8==0 or i==len(stream)-1: trace(l,i+1,dict(**key,arm=arm,seed=seed))
@@ -580,7 +587,7 @@ def run(args):
         print(df.groupby(group)[metrics_cols].mean().round(4))
     print("\nPublished MechEval (NOT the replay proxy above):")
     print(pd.DataFrame(REFERENCE,index=["All_pct","EtC","not_reached_pct"]).T)
-    if args.profile: profile_update(args.device,out)
+    if args.profile: profile_update(args.device,out,profile_samples)
 
 
 if __name__=="__main__":
@@ -599,6 +606,7 @@ if __name__=="__main__":
     p.add_argument("--skip-warc",action="store_true")
     p.add_argument("--warc-arms",default="frozen,ttt,scratch")
     p.add_argument("--ensemble",action="store_true")
+    p.add_argument("--hard-arc",action="store_true")
     p.add_argument("--profile",action="store_true")
     args=p.parse_args()
     if args.device=="cuda" and not torch.cuda.is_available(): raise SystemExit("Select a GPU runtime")
