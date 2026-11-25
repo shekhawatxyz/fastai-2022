@@ -1,12 +1,13 @@
 # Recursive acquisition of executable knowledge
-**Start with [research_state.ipynb](research_state.ipynb), then [experiment_04_stress.ipynb](experiment_04_stress.ipynb).** CPU only for current work. All notebooks and original saved Kaggle outputs are in this directory. Do not rerun archived GPU cells blindly.
+**Canonical branch: `master`. Start with [experiment_05_06.ipynb](experiment_05_06.ipynb), then [research_state.ipynb](research_state.ipynb) for the historical architecture and [experiment_04_stress.ipynb](experiment_04_stress.ipynb) for the previous negative result.** CPU only for current work. All notebooks and original saved Kaggle outputs are in this directory. Do not rerun archived GPU cells blindly.
 
 ![Architecture: failed executor, tested mechanisms, target](architecture.svg)
 
 ## Notebook index
 | Notebook | Purpose |
 |---|---|
-| [research_state.ipynb](research_state.ipynb) | Canonical architecture, references, decisions, unresolved questions |
+| [experiment_05_06.ipynb](experiment_05_06.ipynb) | Latest: executed CPU toys — scoped theory revision and compositional library acquisition; E7 specification |
+| [research_state.ipynb](research_state.ipynb) | Architecture and decisions through E4; historical record |
 | [experiment_ledger_v4.ipynb](experiment_ledger_v4.ipynb) | Cumulative ledger through E4, original saved GPU outputs, CPU code and optional neural replay |
 | [experiment_04_stress.ipynb](experiment_04_stress.ipynb) | NEW: executed stress audit with irregular shifts and partial feedback |
 | [experiment_04.ipynb](experiment_04.ipynb) | E4 standalone CPU reproduction |
@@ -16,10 +17,13 @@
 | [colab.ipynb](colab.ipynb) | Original GPU runner (historical, known bugs in pinned source) |
 | [recursive_world.py](recursive_world.py) | Original E1 implementation (historical; not recommended) |
 
-## Latest decision
+## Latest decision (E5–E6)
+E5: learning a global-versus-local edit prior transfers across two supplied predicate vocabularies when scope frequency matches; it hurts under reversed frequency and two simultaneous edits outside the model. E6: actual AST enumeration acquires named programs and reuses them to synthesize deeper programs; a library-only search fails on an unrelated task. An exploratory bounded library/flat fallback solves 5/5 vs 2/5 for flat search on two fresh permutations of the same engineered curriculum. Neither is novel or SOTA; both use finite synthetic domains. See the notebook for exact controls, CPU measurements, limitations and the E7 test of versioned dependency revision and learned executable theory edits.
+
+## Previous decision (E4)
 E3 joint prior beats factorized prior on controlled correlated tasks, fails under shift. E4 hard context reuse improves return to old regimes but not overall accuracy. Stress audit: context minus change-point = −0.36, −0.18, +0.03 pp for 1,4,81 feedback examples on irregular shifts; all intervals include zero. Random four-feedback gap −1.70 pp. Stop tuning hard allocation. **No current SOTA claim.**
 
-## Next serious experiment
+## Next serious experiment (E7; see notebook for precise gate)
 1. Build typed AST enumeration and discover reusable parameterized subprograms rather than rank a fixed bank. Compare flat enumeration, frequency/search priors, retrieval, and DreamCoder/Stitch-style library compression. Use equal candidate execution and wall-time budgets; account for library construction and meta-training cost. Hold out compositions and longer programs, use two independent task generators and noisy/out-of-library controls.
 2. Introduce explicit versioned dependencies and learned revision operators. Test delayed contradictions and counterexample-driven generalization separately from context selection. Freeze seeds and criteria before evaluation; report search attempts, accuracy by exposure, and paired stream intervals.
 3. Reuse pretrained WARC and the actual full TTT baseline on held-out recordings. Keep strong neural fallback, use only observed transitions for adaptation; compare simple retrieval/keep/consensus controls, report errors corrected and introduced, full compute and exact accuracy. No GPU until CPU gates pass.
