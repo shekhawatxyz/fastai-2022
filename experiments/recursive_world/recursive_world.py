@@ -43,6 +43,7 @@ class Sample:
     a: np.ndarray             # two past actions + action to predict
     y: np.ndarray
     reset: bool = False
+    prior: np.ndarray | None = None  # frozen WARC distribution, never a target
 
     @property
     def s(self): return self.h[-1]
@@ -73,7 +74,7 @@ def sources(board):
 
 
 def actions(a,h,w):
-    ids=F.one_hot(a[...,0],7).float().reshape(len(a),21,1,1).expand(-1,-1,h,w)
+    ids=F.one_hot(a[...,0],8).float().reshape(len(a),24,1,1).expand(-1,-1,h,w)
     yy=torch.arange(h,device=a.device)[None,None,:,None]
     xx=torch.arange(w,device=a.device)[None,None,None,:]
     click=((a[...,0]==6)[...,None,None] & (xx==a[...,1,None,None]) &
@@ -89,13 +90,16 @@ class World(nn.Module):
     The next pass can apply an operation to the result of the previous operation.
     Slot meaning and applicability are independently trainable.
     """
-    def __init__(self,arm,width=32,passes=3):
+    def __init__(self,arm,width=32,passes=3,transfer=False):
         super().__init__()
-        self.arm,self.passes=arm,passes
+        self.arm,self.passes,self.transfer=arm,passes,transfer
         self.symbolic=arm not in ("direct","copy")
         self.dynamic=arm in ("grow","stale")
         n=C if arm=="direct" else O if arm=="copy" else K
-        self.enc=nn.Conv2d(3*(C+1)+24,width,3,padding=1)
+        self.enc=nn.Conv2d(3*(C+1)+27+(C if transfer else 0),width,3,padding=1)
+        if transfer:
+            self.mix=nn.Conv2d(width,1,1)
+            nn.init.zeros_(self.mix.weight); nn.init.constant_(self.mix.bias,-3.)
         self.refine=nn.Sequential(nn.Conv2d(2*width+C+K,width,3,padding=1),
             nn.GroupNorm(4,width),nn.SiLU(),nn.Conv2d(width,width,3,padding=1),
             nn.GroupNorm(4,width),nn.SiLU())
@@ -111,9 +115,13 @@ class World(nn.Module):
             self.guard.bias.zero_()
             if arm!="direct": self.guard.bias[0]=1
 
-    def forward(self,h,a,hard=False,details=False):
+    def forward(self,h,a,hard=False,details=False,prior=None):
         original=onehot(h[:,-1]); board=original
-        base=self.enc(torch.cat((onehot(h,C+1).flatten(1,2),actions(a,*h.shape[-2:])),1))
+        features=[onehot(h,C+1).flatten(1,2),actions(a,*h.shape[-2:])]
+        if self.transfer:
+            assert prior is not None
+            features.append(prior.float())
+        base=self.enc(torch.cat(features,1))
         hidden=base
         label=base.new_zeros((len(h),K,*h.shape[-2:]))
         table=self.effects.float().softmax(-1) if self.symbolic else None
@@ -137,6 +145,12 @@ class World(nn.Module):
                 copy=torch.einsum("bcon,bon->bcn",sources(canvas),w[:,:len(OFF)].flatten(2))
                 board=copy.reshape(b,C,hh,ww)+w[:,len(OFF):]
                 board=board/board.sum(1,keepdim=True).clamp_min(1e-8)
+        # Start close to the pretrained predictor; learn when to trust the new executor.
+        # The direct-transfer control has the identical gate and pretrained input.
+        if self.transfer:
+            gate=self.mix(hidden).float().sigmoid()
+            if hard: board=torch.where(gate>=.5,board,F.one_hot(prior.argmax(1),C).movedim(-1,1).float())
+            else: board=(1-gate)*prior.float()+gate*board
         return (board,q,table,canvas) if details else board
 
     @torch.no_grad()
@@ -185,14 +199,14 @@ def balanced(x,changed):
 
 
 class Learner:
-    def __init__(self,arm,device,seed,lr=0.0003):
+    def __init__(self,arm,device,seed,lr=0.0003,transfer=False):
         torch.manual_seed(seed)
         self.device,self.arm=torch.device(device),arm
-        self.model=World(arm).to(device)
+        self.model=World(arm,transfer=transfer).to(device)
         self.opt=torch.optim.AdamW(self.model.parameters(),lr=lr,weight_decay=.01,
                                    fused=self.device.type=="cuda")
         self.rng=np.random.default_rng(seed)
-        self.data=[]; self.groups=[]; self.labels={}; self.updates=0
+        self.data=[]; self.groups=[]; self.labels={}; self.updates=0; self.examples=0
         self.amp=self.device.type=="cuda" and torch.cuda.is_bf16_supported()
         self.initial=self.snapshot(); self.previous=self.initial
         self.events=[]; self.revision_distance=0.; self.revision_batches=0; self.loss=0.; self.grad=0.
@@ -214,8 +228,9 @@ class Learner:
     def predict(self,s,hard=False):
         self.model.eval()
         h,a,_=pack([s],self.device)
+        prior=None if s.prior is None else torch.as_tensor(s.prior,device=self.device,dtype=torch.float32)[None]
         with torch.autocast(self.device.type,dtype=torch.bfloat16,enabled=self.amp and not hard):
-            return self.model(h,a,hard=hard)[0].float().cpu().numpy()
+            return self.model(h,a,hard=hard,prior=prior)[0].float().cpu().numpy()
 
     @torch.no_grad()
     def observe(self,views):
@@ -223,19 +238,20 @@ class Learner:
         self.groups.append(list(range(len(self.data),len(self.data)+len(views))))
         for view in views:
             h,a,y=pack([view],self.device)
-            i=len(self.data); self.data.append((h[0],a[0],y[0]))
+            prior=None if view.prior is None else torch.as_tensor(view.prior,device=self.device,dtype=torch.float32)
+            i=len(self.data); self.data.append((h[0],a[0],y[0],prior))
             if self.arm=="stale":
-                self.labels[i]=relabel(self.model(h,a,details=True),y)[0].half()
+                self.labels[i]=relabel(self.model(h,a,details=True,prior=None if prior is None else prior[None]),y)[0].half()
 
     def batch(self,ids):
-        return tuple(torch.stack(xs) for xs in zip(*(self.data[int(i)] for i in ids)))
+        return tuple(None if xs[0] is None else torch.stack(xs) for xs in zip(*(self.data[int(i)] for i in ids)))
 
     def step(self,ids):
-        h,a,y=self.batch(ids)
+        h,a,y,prior=self.batch(ids)
         changed=y!=h[:,-1]
         self.model.train(); self.opt.zero_grad(set_to_none=True)
         with torch.autocast(self.device.type,dtype=torch.bfloat16,enabled=self.amp):
-            detail=self.model(h,a,details=True); pred,q,_,_=detail
+            detail=self.model(h,a,details=True,prior=prior); pred,q,_,_=detail
             loss=balanced(-pred.gather(1,y[:,None]).squeeze(1).clamp_min(1e-7).log(),changed)
             if self.arm in ("fixed","small","grow","stale"):
                 fresh=relabel(detail,y)
@@ -254,7 +270,7 @@ class Learner:
         if not torch.isfinite(loss): raise FloatingPointError("Nonfinite loss")
         loss.backward()
         norm=nn.utils.clip_grad_norm_(self.model.parameters(),1.,error_if_nonfinite=True)
-        self.opt.step(); self.updates+=1
+        self.opt.step(); self.updates+=1; self.examples+=len(ids)
         self.loss,self.grad=float(loss.detach()),float(norm)
 
     @torch.no_grad()
@@ -263,8 +279,8 @@ class Learner:
         if not self.model.dynamic or self.model.active.all() or epoch%4: return
         # Use the same recent replay for both dynamic ablations.
         ids=[g[0] for g in self.groups[-8:]]
-        h,a,y=self.batch(ids)
-        pred,q,_,_=self.model(h,a,details=True)
+        h,a,y,prior=self.batch(ids)
+        pred,q,_,_=self.model(h,a,details=True,prior=prior)
         mask=(y!=h[:,-1])
         if not mask.any(): return
         error=(pred.argmax(1)!=y)&mask
@@ -283,8 +299,14 @@ class Learner:
         # for ARC; sample uniformly across the resulting views.
         n=len(self.groups); cut=max(0,n-10)
         old=self.rng.choice(cut,min(cut,20),replace=False)
-        bank=np.array([i for g in [*old,*range(cut,n)] for i in self.groups[g]])
-        for _ in range(steps): self.step(self.rng.choice(bank,min(batch,len(bank)),replace=False))
+        # Released recipe: identity once, each rotated view ten times.
+        bank=np.array([i for g in [*old,*range(cut,n)] for j,i in enumerate(self.groups[g]) for _ in range(1 if j==0 else 10)])
+        done=0
+        while done<steps:
+            shuffled=self.rng.permutation(bank)
+            for start in range(0,len(shuffled),batch):
+                self.step(shuffled[start:start+batch]); done+=1
+                if done==steps: break
         self.reconsider(epoch)
 
     def vocabulary(self,epoch):
@@ -337,18 +359,18 @@ def parse(records,limit):
             if f.ndim==3: f=f[-1]
             if f.shape!=(64,64) or not np.issubdtype(f.dtype,np.number) or np.any((f<0)|(f>=C)): raise ValueError()
             f=f.astype(np.uint8)
-            ai=d.get("action_input") or {}; ad=ai.get("data") or {}; a=int(ai.get("id",0))
+            ai=d.get("action_input") or {}; ad=ai.get("data") or {}; raw=ai.get("id",0); a=int(str(raw).removeprefix("ACTION")) if str(raw).removeprefix("ACTION").isdigit() else 0
             act=(a,int(ad["x"]) if a==6 else -1,int(ad["y"]) if a==6 else -1)
             lv=d.get("levels_completed",0)
         except (ValueError,TypeError,KeyError,IndexError):
             frames=[]; inter=[]; level=None; reset=True; continue
-        valid=bool(frames) and level==lv and 1<=a<=6 and not d.get("full_reset",False) and str(d.get("state","")).upper() not in ("WIN","GAME_OVER")
+        valid=bool(frames) and level==lv and 1<=a<=7 and not d.get("full_reset",False) and str(d.get("state","")).upper() not in ("WIN","GAME_OVER")
         if valid:
             h=np.stack([np.full_like(f,16)]*(3-len(frames))+frames)
             acts=np.array([(0,-1,-1)]*(2-len(inter))+inter+[act])
             out.append(Sample(h,acts,f,reset)); reset=False
             frames=(frames+[f])[-3:]; inter=(inter+[act])[-2:]
-            if len(out)>=limit: break
+            if limit>0 and len(out)>=limit: break
         else: frames=[f]; inter=[]; reset=True
         level=lv
     return out
@@ -374,12 +396,12 @@ def arc_streams(args):
                 if isinstance(raw,dict): raw=raw.get("trajectory",raw.get("records",raw.get("events",[])))
                 yield g,str(row["guid"]),raw
     for g,sid,raw in records():
-        if counts[g]>=args.sessions: continue
+        if args.sessions>0 and counts[g]>=args.sessions: continue
         s=parse(raw,args.limit)
-        if len(s)<min(12,args.limit): continue
+        if len(s)<(min(12,args.limit) if args.limit>0 else 1): continue
         counts[g]+=1; yield g,sid,s
-        if all(v>=args.sessions for v in counts.values()): return
-    if any(v<args.sessions for v in counts.values()): raise RuntimeError(f"Insufficient recordings: {counts}")
+        if args.sessions>0 and all(v>=args.sessions for v in counts.values()): return
+    if any(v<max(1,args.sessions) for v in counts.values()): raise RuntimeError(f"Insufficient recordings: {counts}")
 
 
 def rotation_views(s):
@@ -394,6 +416,25 @@ def rotation_views(s):
             h.append(x); a.append((aid,cx,cy))
         out.append(Sample(np.stack(h),np.array(a),y,s.reset))
     return out
+
+
+def frozen_teacher(game,device):
+    """Use only a held-out fold checkpoint; no adaptation on target observations."""
+    from huggingface_hub import hf_hub_download
+    from warc_model.final_ttt import FinalPredictor
+    fold=next(f for f,gs in FOLDS.items() if game in gs)
+    ckpt=hf_hub_download("third-intelligence/WARC",f"fold{fold}/checkpoint_best.pt")
+    return FinalPredictor(ckpt,game=game,arm="frozen",device=device,seed=0,strict_split=True).model
+
+@torch.no_grad()
+def attach_priors(teacher,views,device):
+    h,a,_=pack(views,device)
+    with torch.autocast("cuda",dtype=torch.bfloat16,enabled=torch.cuda.is_bf16_supported()):
+        logits=teacher.forward_dynamics(h[:,-1],torch.zeros(len(h),device=device,dtype=torch.long),
+                  *a[:,-1].unbind(-1),hist_obs=h,hist_action_ids=a[:,:2,0],
+                  hist_action_xs=a[:,:2,1],hist_action_ys=a[:,:2,2])
+    for v,p in zip(views,logits.float().softmax(1).cpu().numpy()): v.prior=p
+    return views
 
 
 def warc_scores(game,stream,arm,seed,device):
@@ -465,6 +506,13 @@ def selftest(device):
         assert any(r["rms_step"]>0 for r in l.drift(1))
         if l.model.dynamic:
             n=int(l.model.active.sum()); l.model.split(0,l.opt); assert int(l.model.active.sum())==n+1
+    # Transfer smoke: synthetic prior is input-only, not the ground truth.
+    t=Sample(s.h,s.a,s.y,s.reset,np.eye(C,dtype=np.float32)[s.s].transpose(2,0,1))
+    for arm in ("direct","grow","stale"):
+        l=Learner(arm,device,0,transfer=True)
+        p=l.predict(t)
+        assert np.allclose(p.sum(0),1,atol=1e-4)
+        l.observe([t]); l.step([0]); assert l.examples==1
     print("Self-tests passed",flush=True)
 
 
@@ -472,9 +520,10 @@ def run(args):
     import pandas as pd
     out=Path(args.out); out.mkdir(parents=True,exist_ok=True)
     scores=[]; drift=[]; logs=[]; vocab=[]; births=[]; profile_samples=None
+    (out/"config.json").write_text(json.dumps(dict(**vars(args),torch=torch.__version__,gpu=torch.cuda.get_device_name(0) if args.device=="cuda" else None),indent=2))
     arms=args.arms.split(","); assert all(a in ARMS for a in arms)
     def trace(l,epoch,key):
-        logs.append(dict(**key,epoch=epoch,loss=l.loss,grad_norm=l.grad,updates=l.updates,
+        logs.append(dict(**key,epoch=epoch,loss=l.loss,grad_norm=l.grad,updates=l.updates,examples=l.examples,
                          revision_distance=l.revision_distance/max(1,l.revision_batches),active=int(l.model.active.sum()),
                          params=sum(p.numel() for p in l.model.parameters())))
         drift.extend(dict(**key,**r) for r in l.drift(epoch))
@@ -539,27 +588,42 @@ def run(args):
                 else: p=s.s
                 scores.append(dict(**key,arm="local retrieval",seed=0,step=i,**metrics(s.s,s.y,p)))
                 history.append(s)
-            for arm in arms:
+            # Cache predictions from immutable WARC, using only history/action.
+            # This can be shared across arms; report its time separately.
+            cache=None; teacher_seconds=0.
+            if args.transfer:
+                teacher=frozen_teacher(game,args.device)
+                sync(); started=time.perf_counter()
+                cache=[attach_priors(teacher,rotation_views(s),args.device) for s in stream]
+                sync(); teacher_seconds=time.perf_counter()-started
+                del teacher; gc.collect(); torch.cuda.empty_cache()
+            modes=[(arm,False) for arm in arms]
+            if args.transfer: modes += [(arm,True) for arm in args.transfer_arms.split(",")]
+            for arm,transfer in modes:
+                assert arm in ARMS
+                name="transfer_"+arm if transfer else arm
                 members=[]
                 for seed in range(args.seeds):
-                    l=Learner(arm,args.device,seed)
+                    l=Learner(arm,args.device,seed,transfer=transfer)
                     probabilities=[]
                     for i,s in enumerate(stream):
+                        if transfer: s=cache[i][0]
                         sync(); t=time.perf_counter(); probs=l.predict(s); p=probs.argmax(0); sync(); pt=time.perf_counter()-t
                         if args.ensemble: probabilities.append(probs)
                         row=metrics(s.s,s.y,p)
                         if l.model.symbolic and args.hard_arc:
                             hard=l.predict(s,True).argmax(0)
-                            scores.append(dict(**key,arm=arm+"_hard",seed=seed,step=i,**metrics(s.s,s.y,hard)))
-                        t=time.perf_counter(); l.observe(rotation_views(s)); l.online(i+1,args.steps); sync()
-                        scores.append(dict(**key,arm=arm,seed=seed,step=i,predict_s=pt,update_s=time.perf_counter()-t,**row))
-                        if (i+1)%8==0 or i==len(stream)-1: trace(l,i+1,dict(**key,arm=arm,seed=seed))
-                    births.extend(dict(**key,arm=arm,seed=seed,**r) for r in l.events); save()
+                            scores.append(dict(**key,arm=name+"_hard",seed=seed,step=i,**metrics(s.s,s.y,hard)))
+                        t=time.perf_counter(); l.observe(cache[i] if transfer else rotation_views(s)); l.online(i+1,args.steps); sync()
+                        scores.append(dict(**key,arm=name,seed=seed,step=i,predict_s=pt,update_s=time.perf_counter()-t,teacher_cache_s=teacher_seconds/len(stream) if transfer else 0.,updates=l.updates,examples=l.examples,**row))
+                        if (i+1)%8==0 or i==len(stream)-1: trace(l,i+1,dict(**key,arm=name,seed=seed))
+                    births.extend(dict(**key,arm=name,seed=seed,**r) for r in l.events); save()
+                    print(game,sid,name,seed,"complete",flush=True)
                     if args.ensemble: members.append(np.stack(probabilities))
                     del l; gc.collect(); torch.cuda.empty_cache()
                 if args.ensemble and len(members)>1:
                     for i,(sample,prob) in enumerate(zip(stream,np.mean(members,axis=0))):
-                        scores.append(dict(**key,arm=arm+"_ensemble",seed=-1,step=i,
+                        scores.append(dict(**key,arm=name+"_ensemble",seed=-1,step=i,
                                            **metrics(sample.s,sample.y,prob.argmax(0))))
                 save()
             if not args.skip_warc:
@@ -607,9 +671,12 @@ if __name__=="__main__":
     p.add_argument("--warc-arms",default="frozen,ttt,scratch")
     p.add_argument("--ensemble",action="store_true")
     p.add_argument("--hard-arc",action="store_true")
+    p.add_argument("--transfer",action="store_true")
+    p.add_argument("--transfer-arms",default="direct,fixed,small,stale,grow")
     p.add_argument("--profile",action="store_true")
     args=p.parse_args()
     if args.device=="cuda" and not torch.cuda.is_available(): raise SystemExit("Select a GPU runtime")
     if args.device=="cuda": torch.set_float32_matmul_precision("high")
     else: torch.set_num_threads(min(4,torch.get_num_threads()))
+    if args.suite=="arc" and not args.skip_warc and args.steps!=20: p.error("WARC uses 20 steps; keep --steps 20 for paired comparisons")
     selftest(args.device); run(args)
